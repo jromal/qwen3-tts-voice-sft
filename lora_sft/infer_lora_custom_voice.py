@@ -135,12 +135,13 @@ def main():
         attn_implementation=args.attn_implementation,
     )
 
-    peft_model = PeftModel.from_pretrained(tts.model, args.adapter_path)
+    # WATCH THE BOOK: Load the PEFT adapter cleanly onto the inner talker submodule (tts.model.talker)
+    peft_model = PeftModel.from_pretrained(tts.model.talker, args.adapter_path)
     _set_lora_scale(peft_model, args.lora_scale)
     if args.no_merge_lora:
-        tts.model = peft_model
+        tts.model.talker = peft_model
     else:
-        tts.model = peft_model.merge_and_unload()
+        tts.model.talker = peft_model.merge_and_unload()
 
     core_model = _resolve_core_model(tts.model)
     _apply_speaker_config(core_model, args.adapter_path, args.speaker_name, args.speaker_id)
