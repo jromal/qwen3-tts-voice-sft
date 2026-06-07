@@ -95,8 +95,15 @@ def compute_loss(model, batch):
     input_text_ids = input_ids[:, :, 0]
     input_codec_ids = input_ids[:, :, 1]
 
-    # Bug Fix 1: Apply the missing text projection layer on text embeddings
-    input_text_embedding = model.talker.model.text_embedding(input_text_ids)
+    # WATCH THE BOOK: Unpeel the PEFT wrapper if present to access raw embedding layers cleanly
+    talker = model.talker
+    if hasattr(talker, "base_model") and hasattr(talker.base_model, "model"):
+        raw_talker = talker.base_model.model
+    else:
+        raw_talker = talker
+
+    # Bug Fix 1: Apply the missing text projection layer on text embeddings using raw_talker
+    input_text_embedding = raw_talker.model.text_embedding(input_text_ids)
     if hasattr(model.talker, 'text_projection'):
         input_text_embedding = model.talker.text_projection(input_text_embedding)
     input_text_embedding = input_text_embedding * text_embedding_mask
@@ -127,7 +134,9 @@ def compute_loss(model, batch):
         talker_codec_ids, talker_hidden_states
     )
 
-    # Balanced SFT loss: scale the sub-talker by 0.3 so it does not overpower the primary talker (which predicts EOS)
+    # For LoRA SFT, the Code Predictor (sub-talker layers 1-15) is completely frozen.
+    # Backpropagating sub_talker_loss corrupts your active attention adapter gradients, causing severe voice warping.
+    # We set its weight to 0.0, supervising only Codebook 0 (outputs.loss).
     return outputs.loss
 
 
