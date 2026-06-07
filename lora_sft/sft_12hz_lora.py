@@ -127,8 +127,10 @@ def compute_loss(model, batch):
         talker_codec_ids, talker_hidden_states
     )
 
-    # Balanced SFT loss: scale the sub-talker by 0.3 so it does not overpower the primary talker (which predicts EOS)
-    return outputs.loss + 0.3 * sub_talker_loss
+    # For LoRA SFT, the Code Predictor (sub-talker layers 1-15) is completely frozen.
+    # Backpropagating sub_talker_loss corrupts your active attention adapter gradients, causing severe voice warping.
+    # We set its weight to 0.0, supervising only Codebook 0 (outputs.loss).
+    return outputs.loss
 
 
 def evaluate(model, dataloader, accelerator):
@@ -305,11 +307,18 @@ def train():
             with open(output_config_file, "w", encoding="utf-8") as f:
                 json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
+            # Save the pre-computed speaker embedding vector
             if target_speaker_embedding is not None:
                 save_file(
                     {"target_speaker_embedding": target_speaker_embedding[0]},
                     os.path.join(output_dir, "speaker_embedding.safetensors"),
                 )
+
+            # WATCH THE BOOK: Copy your raw ref.wav training file as ref_sample.wav for universal third-party compatibility
+            local_ref_path = "ref.wav"
+            if os.path.exists(local_ref_path):
+                shutil.copy2(local_ref_path, os.path.join(output_dir, "ref_sample.wav"))
+                print(f"   ✅ Saved reference artifact: ref_sample.wav")
 
             # Checkpoint Pruning using stable numerical sort by epoch index
             output_path_obj = Path(args.output_model_path)
