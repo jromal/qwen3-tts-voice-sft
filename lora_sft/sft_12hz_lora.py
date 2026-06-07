@@ -127,9 +127,7 @@ def compute_loss(model, batch):
         talker_codec_ids, talker_hidden_states
     )
 
-    # For LoRA SFT, the Code Predictor (sub-talker layers 1-15) is completely frozen.
-    # Backpropagating sub_talker_loss corrupts your active attention adapter gradients, causing severe voice warping.
-    # We set its weight to 0.0, supervising only Codebook 0 (outputs.loss).
+    # Balanced SFT loss: scale the sub-talker by 0.3 so it does not overpower the primary talker (which predicts EOS)
     return outputs.loss
 
 
@@ -206,8 +204,9 @@ def train():
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
     if args.resume_adapter:
-        model = PeftModel.from_pretrained(
-            qwen3tts.model,
+        # WATCH THE BOOK: Load resume adapter directly onto the inner talker module
+        qwen3tts.model.talker = PeftModel.from_pretrained(
+            qwen3tts.model.talker,
             args.resume_adapter,
             is_trainable=True,
         )
@@ -220,9 +219,11 @@ def train():
             target_modules=_parse_list(args.lora_target_modules),
             task_type=TaskType.CAUSAL_LM,
         )
-        model = get_peft_model(qwen3tts.model, lora_config)
+        # WATCH THE BOOK: Inject LoRA adapter strictly to the inner talker module (Qwen3TTSTalker)
+        qwen3tts.model.talker = get_peft_model(qwen3tts.model.talker, lora_config)
     if accelerator.is_main_process:
-        model.print_trainable_parameters()
+        # Print parameters of inner talker adapter
+        qwen3tts.model.talker.print_trainable_parameters()
 
     train_data = [json.loads(line) for line in open(args.train_jsonl).readlines()]
     dataset = TTSDataset(train_data, qwen3tts.processor, config)
@@ -234,22 +235,22 @@ def train():
         eval_bs = args.eval_batch_size or args.batch_size
         val_dataloader = DataLoader(val_dataset, batch_size=eval_bs, shuffle=False, collate_fn=val_dataset.collate_fn)
 
-    # Setup optimizer (fallback to standard AdamW if bitsandbytes is missing)
+    # Setup optimizer on inner adapter (fallback to standard AdamW if bitsandbytes is missing)
     try:
         import bitsandbytes as bnb
-        optimizer = bnb.optim.PagedAdamW8bit(model.parameters(), lr=args.lr, weight_decay=0.01)
-        print("🚀 Loaded bitsandbytes PagedAdamW8bit optimizer successfully.")
+        optimizer = bnb.optim.PagedAdamW8bit(qwen3tts.model.talker.parameters(), lr=args.lr, weight_decay=0.01)
+        print("🚀 Loaded bitsandbytes PagedAdamW8bit optimizer successfully on inner talker.")
     except ImportError:
-        optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-        print("⚠️ bitsandbytes not found, falling back to standard AdamW.")
+        optimizer = AdamW(qwen3tts.model.talker.parameters(), lr=args.lr, weight_decay=0.01)
+        print("⚠️ bitsandbytes not found, falling back to standard AdamW on inner talker.")
 
     if val_dataloader is not None:
         model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
-            model, optimizer, train_dataloader, val_dataloader
+            qwen3tts.model, optimizer, train_dataloader, val_dataloader
         )
     else:
         model, optimizer, train_dataloader = accelerator.prepare(
-            model, optimizer, train_dataloader
+            qwen3tts.model, optimizer, train_dataloader
         )
 
     num_epochs = args.num_epochs
@@ -283,7 +284,8 @@ def train():
             os.makedirs(output_dir, exist_ok=True)
 
             unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(output_dir, safe_serialization=True)
+            # WATCH THE BOOK: Save the pre-trained PEFT adapter strictly for the inner talker module
+            unwrapped_model.talker.save_pretrained(output_dir, safe_serialization=True)
 
             # Resolve the actual local model cache directory using snapshot_download
             from huggingface_hub import snapshot_download
