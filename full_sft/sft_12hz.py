@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
 # =====================================================================
-# WATCH THE BOOK: GradScaler FP16 gradient override patch
+# GRADIO/ACCELERATE FP16 gradient override patch
 # =====================================================================
 try:
     import torch.amp.grad_scaler
@@ -66,7 +66,7 @@ def train():
     parser.add_argument("--output_model_path", type=str, default="output")
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-6)  # Default corrected to prevent weight explosions
+    parser.add_argument("--lr", type=float, default=2e-6)  # Recommended range [1e-6, 2e-6]
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     args = parser.parse_args()
@@ -175,23 +175,24 @@ def train():
                     output_hidden_states=True
                 )
 
-                # Adjust hidden states slicing to align correctly with unshifted inputs
-                hidden_states = outputs.hidden_states[0][-1][:, :-1, :]
-                talker_hidden_states = hidden_states[codec_mask[:, 1:]]
-                talker_codec_ids = codec_ids[codec_mask]
+                # Fix: Resolve slice-alignment mismatch for the sub-talker outputs
+                hidden_states = outputs.hidden_states[0][-1]
+                target_codec_mask = codec_mask[:, 1:]
+                talker_hidden_states = hidden_states[:, :-1, :][target_codec_mask]
+                talker_codec_ids = codec_ids[:, 1:][target_codec_mask]
 
                 sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
 
-                # Balanced SFT loss: scale the sub-talker by 0.3 so it does not overpower the primary talker (which predicts EOS)
+                # Balanced SFT loss: scale the sub-talker by 0.3 so it does not overpower the primary talker
                 loss = outputs.loss + 0.3 * sub_talker_loss
 
                 accelerator.backward(loss)
 
+                # Fix: Wrap optimizer update step inside the sync_gradients block to keep accumulation statistics intact
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
-
-                optimizer.step()
-                optimizer.zero_grad()
+                    optimizer.step()
+                    optimizer.zero_grad()
 
             if step % 10 == 0:
                 accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
@@ -199,7 +200,7 @@ def train():
         if accelerator.is_main_process:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
             
-            # WATCH THE BOOK: Resolve the actual local model cache directory using snapshot_download
+            # Resolve the actual local model cache directory using snapshot_download
             from huggingface_hub import snapshot_download
             if os.path.isdir(MODEL_PATH):
                 model_cache_path = MODEL_PATH
@@ -231,10 +232,11 @@ def train():
                 for k, v in unwrapped_model.state_dict().items()
             }
 
-            drop_prefix = "speaker_encoder"
-            keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
-            for k in keys_to_drop:
-                del state_dict[k]
+            # Fix: Comment out the dropping of speaker_encoder weights to retain in-context zero-shot capabilities during inference
+            # drop_prefix = "speaker_encoder"
+            # keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
+            # for k in keys_to_drop:
+            #     del state_dict[k]
 
             weight = state_dict['talker.model.codec_embedding.weight']
             state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)

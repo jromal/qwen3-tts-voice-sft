@@ -36,7 +36,7 @@ except ImportError as exc:
     ) from exc
 
 # =====================================================================
-# WATCH THE BOOK: GradScaler FP16 gradient override patch
+# GRADIO/ACCELERATE FP16 gradient override patch
 # =====================================================================
 try:
     import torch.amp.grad_scaler
@@ -54,7 +54,6 @@ except Exception:
 # =====================================================================
 
 
-# WATCH THE BOOK: Dynamic attention fallback detection
 def get_attention_implementation():
     """Return best available attention implementation."""
     try:
@@ -95,20 +94,18 @@ def compute_loss(model, batch):
     input_text_ids = input_ids[:, :, 0]
     input_codec_ids = input_ids[:, :, 1]
 
-    # WATCH THE BOOK: Unpeel the PEFT wrapper if present to access raw embedding layers cleanly
     talker = model.talker
     if hasattr(talker, "base_model") and hasattr(talker.base_model, "model"):
         raw_talker = talker.base_model.model
     else:
         raw_talker = talker
 
-    # Bug Fix 1: Apply the missing text projection layer on text embeddings using raw_talker
+    # Bug Fix 1: Apply the missing text projection layer on text embeddings
     input_text_embedding = raw_talker.model.text_embedding(input_text_ids)
     if hasattr(model.talker, 'text_projection'):
         input_text_embedding = model.talker.text_projection(input_text_embedding)
     input_text_embedding = input_text_embedding * text_embedding_mask
     
-    # Stable Codec Embedding Access via raw_talker
     input_codec_embedding = raw_talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
     input_codec_embedding[:, 6, :] = speaker_embedding
 
@@ -127,18 +124,16 @@ def compute_loss(model, batch):
         output_hidden_states=True,
     )
 
-    # Adjust hidden states slicing to align correctly with unshifted inputs
-    hidden_states = outputs.hidden_states[0][-1][:, :-1, :]
-    talker_hidden_states = hidden_states[codec_mask[:, 1:]]
-    talker_codec_ids = codec_ids[codec_mask]
+    # Fix: Resolve slice-alignment mismatch for the sub-talker outputs
+    hidden_states = outputs.hidden_states[0][-1]
+    target_codec_mask = codec_mask[:, 1:]
+    talker_hidden_states = hidden_states[:, :-1, :][target_codec_mask]
+    talker_codec_ids = codec_ids[:, 1:][target_codec_mask]
 
     _, sub_talker_loss = model.talker.forward_sub_talker_finetune(
         talker_codec_ids, talker_hidden_states
     )
 
-    # For LoRA SFT, the Code Predictor (sub-talker layers 1-15) is completely frozen.
-    # Backpropagating sub_talker_loss corrupts your active attention adapter gradients, causing severe voice warping.
-    # We set its weight to 0.0, supervising only Codebook 0 (outputs.loss).
     return outputs.loss
 
 
@@ -173,7 +168,7 @@ def train():
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
-    parser.add_argument("--attn_implementation", type=str, default=get_attention_implementation())  # Fixed: Dynamically fallback to SDPA if flash-attn is missing
+    parser.add_argument("--attn_implementation", type=str, default=get_attention_implementation())
     parser.add_argument("--save_every", type=int, default=1)
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
@@ -215,7 +210,6 @@ def train():
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
     if args.resume_adapter:
-        # WATCH THE BOOK: Load resume adapter directly onto the inner talker module
         qwen3tts.model.talker = PeftModel.from_pretrained(
             qwen3tts.model.talker,
             args.resume_adapter,
@@ -230,10 +224,8 @@ def train():
             target_modules=_parse_list(args.lora_target_modules),
             task_type=TaskType.CAUSAL_LM,
         )
-        # WATCH THE BOOK: Inject LoRA adapter strictly to the inner talker module (Qwen3TTSTalker)
         qwen3tts.model.talker = get_peft_model(qwen3tts.model.talker, lora_config)
     if accelerator.is_main_process:
-        # Print parameters of inner talker adapter
         qwen3tts.model.talker.print_trainable_parameters()
 
     train_data = [json.loads(line) for line in open(args.train_jsonl).readlines()]
@@ -275,11 +267,11 @@ def train():
 
                 accelerator.backward(loss)
 
+                # Fix: Wrap optimizer update step inside the sync_gradients block to keep accumulation statistics intact
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
-
-                optimizer.step()
-                optimizer.zero_grad()
+                    optimizer.step()
+                    optimizer.zero_grad()
 
             if step % 10 == 0:
                 accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
@@ -295,7 +287,6 @@ def train():
             os.makedirs(output_dir, exist_ok=True)
 
             unwrapped_model = accelerator.unwrap_model(model)
-            # WATCH THE BOOK: Save the pre-trained PEFT adapter strictly for the inner talker module
             unwrapped_model.talker.save_pretrained(output_dir, safe_serialization=True)
 
             # Resolve the actual local model cache directory using snapshot_download
@@ -327,7 +318,6 @@ def train():
                     os.path.join(output_dir, "speaker_embedding.safetensors"),
                 )
 
-            # WATCH THE BOOK: Copy your raw ref.wav training file as ref_sample.wav for universal third-party compatibility
             local_ref_path = "ref.wav"
             if os.path.exists(local_ref_path):
                 shutil.copy2(local_ref_path, os.path.join(output_dir, "ref_sample.wav"))
