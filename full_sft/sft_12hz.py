@@ -74,14 +74,16 @@ def train():
     # Select dynamic precision based on real hardware capability (Ampere+ Score >= 8.0 required for BF16)
     device_cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
     target_dtype = torch.bfloat16 if device_cap[0] >= 8 else torch.float16
-    print(f"Selected hardware dtype: {target_dtype} (Turing/Volta compatible)")
 
     # Setup logging directory for TensorBoard to prevent accelerate value errors
     logging_dir = os.path.join(args.output_model_path, "logs")
     os.makedirs(logging_dir, exist_ok=True)
 
+    # Hardcoded gradient accumulation value matching SFT setup
+    grad_accum_steps = 4
+
     accelerator = Accelerator(
-        gradient_accumulation_steps=4, 
+        gradient_accumulation_steps=grad_accum_steps, 
         mixed_precision="bf16" if target_dtype == torch.bfloat16 else "fp16", 
         log_with="tensorboard",
         project_dir=logging_dir
@@ -91,7 +93,6 @@ def train():
 
     # Detect attention implementation
     attn_implementation = get_attention_implementation()
-    print(f"Using attention implementation: {attn_implementation}")
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
@@ -102,10 +103,8 @@ def train():
     # Force enable gradient checkpointing on the model to reduce activation VRAM bounds
     if hasattr(qwen3tts.model, "model") and hasattr(qwen3tts.model.model, "gradient_checkpointing_enable"):
         qwen3tts.model.model.gradient_checkpointing_enable()
-        print("🚀 Enabled gradient checkpointing on underlying model.")
     elif hasattr(qwen3tts.model, "gradient_checkpointing_enable"):
         qwen3tts.model.gradient_checkpointing_enable()
-        print("🚀 Enabled gradient checkpointing on model.")
 
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
@@ -118,16 +117,44 @@ def train():
     try:
         import bitsandbytes as bnb
         optimizer = bnb.optim.PagedAdamW8bit(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
-        print("🚀 Loaded bitsandbytes PagedAdamW8bit optimizer successfully.")
+        optimizer_name = "PagedAdamW8bit (bitsandbytes)"
     except ImportError:
         optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
-        print("⚠️ bitsandbytes not found, falling back to standard AdamW.")
+        optimizer_name = "Standard AdamW (PyTorch)"
 
     model, optimizer, train_dataloader = accelerator.prepare(
         qwen3tts.model, optimizer, train_dataloader
     )
 
     num_epochs = args.num_epochs
+
+    # Calculate dynamic execution variables for the metadata block
+    total_samples = len(dataset)
+    steps_per_epoch = len(train_dataloader)
+    total_raw_steps = steps_per_epoch * num_epochs
+    effective_opt_steps = total_raw_steps // grad_accum_steps
+
+    # ── REGISTERED TRAINING DASHBOARD (Just Before the First Epoch) ──
+    if accelerator.is_main_process:
+        print("\n" + "="*70)
+        print("🎙️  QWEN3-TTS FULL-PARAMETER SFT TRAINING ENGINE RUNTIME")
+        print("="*70)
+        print(f"👤 Target Speaker ID         : {args.speaker_name}")
+        print(f"🤖 Initial Model Checkpoint  : {args.init_model_path}")
+        print(f"📂 Output Checkpoint Path    : {args.output_model_path}")
+        print(f"📊 Dataset Size              : {total_samples} samples (approx. {round((total_samples * 6) / 60, 1)} minutes)")
+        print(f"⏱️  Training Epochs Limit     : {num_epochs}")
+        print(f"🔄 Steps per Training Epoch  : {steps_per_epoch}")
+        print(f"📈 Total Batch Accumulations : {total_raw_steps}")
+        print(f"📉 Effective Optimization Steps: {effective_opt_steps} updates")
+        print(f"⚡ Base SFT Learning Rate    : {args.lr}")
+        print(f"🔋 Physical Batch Size       : {args.batch_size}")
+        print(f"🔄 Gradient Accumulation     : {grad_accum_steps}")
+        print(f"🧮 Auto Hardware Precision   : {target_dtype} (Mixed Precision Mode)")
+        print(f"🎯 Local Attention Type     : {attn_implementation}")
+        print(f"🛠️  Loaded Optimizer         : {optimizer_name}")
+        print("="*70 + "\n")
+
     model.train()
 
     for epoch in range(num_epochs):
@@ -232,7 +259,7 @@ def train():
                 for k, v in unwrapped_model.state_dict().items()
             }
 
-            # Fix: Comment out the dropping of speaker_encoder weights to retain in-context zero-shot capabilities during inference
+            # Commented out the dropping of speaker_encoder weights to retain in-context zero-shot capabilities during inference
             # drop_prefix = "speaker_encoder"
             # keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
             # for k in keys_to_drop:
