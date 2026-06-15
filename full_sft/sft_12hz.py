@@ -62,13 +62,13 @@ def train():
     global target_speaker_embedding
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-    parser.add_argument("--output_model_path", type=str, default="output")
-    parser.add_argument("--train_jsonl", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-6)  # Recommended range [1e-6, 2e-6]
-    parser.add_argument("--num_epochs", type=int, default=3)
-    parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument('--init_model_path', type=str, default='Qwen/Qwen3-TTS-12Hz-1.7B-Base')
+    parser.add_argument('--output_model_path', type=str, default='output')
+    parser.add_argument('--train_jsonl', type=str, required=True)
+    parser.add_argument('--batch_size', type=int, default=2)
+    parser.add_argument('--lr', type=float, default=2e-6)  # Recommended range [1e-6, 2e-6]
+    parser.add_argument('--num_epochs', type=int, default=3)
+    parser.add_argument('--speaker_name', type=str, default='speaker_test')
     args = parser.parse_args()
 
     # Select dynamic precision based on real hardware capability (Ampere+ Score >= 8.0 required for BF16)
@@ -76,7 +76,7 @@ def train():
     target_dtype = torch.bfloat16 if device_cap[0] >= 8 else torch.float16
 
     # Setup logging directory for TensorBoard to prevent accelerate value errors
-    logging_dir = os.path.join(args.output_model_path, "logs")
+    logging_dir = os.path.join(args.output_model_path, 'logs')
     os.makedirs(logging_dir, exist_ok=True)
 
     # Hardcoded gradient accumulation value matching SFT setup
@@ -84,8 +84,8 @@ def train():
 
     accelerator = Accelerator(
         gradient_accumulation_steps=grad_accum_steps, 
-        mixed_precision="bf16" if target_dtype == torch.bfloat16 else "fp16", 
-        log_with="tensorboard",
+        mixed_precision='bf16' if target_dtype == torch.bfloat16 else 'fp16', 
+        log_with='tensorboard',
         project_dir=logging_dir
     )
 
@@ -100,10 +100,37 @@ def train():
         attn_implementation=attn_implementation,
     )
 
+    # ── DYNAMIC SPEAKER ENCODER RESTORATION (Initializes with base config to prevent dimension mismatch) ──
+    if not hasattr(qwen3tts.model, 'speaker_encoder') or qwen3tts.model.speaker_encoder is None:
+        if accelerator.is_main_process:
+            print('📥 CustomVoice base detected. Dynamically restoring Speaker Encoder from Base model...', flush=True)
+        from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSSpeakerEncoder
+        from transformers import AutoConfig
+        from huggingface_hub import hf_hub_download
+        from safetensors.torch import load_file
+        try:
+            # Target correct base config dynamically to match the model scale scale parameters
+            base_model_id = 'Qwen/Qwen3-TTS-12Hz-1.7B-Base' if '1.7B' in MODEL_PATH else 'Qwen/Qwen3-TTS-12Hz-0.6B-Base'
+            base_config = AutoConfig.from_pretrained(base_model_id)
+            
+            # Instantiates with 2048-dim configurations to avoid CustomVoice 1024-dim mismatch failures
+            qwen3tts.model.speaker_encoder = Qwen3TTSSpeakerEncoder(base_config.speaker_encoder_config)
+            
+            base_model_file = hf_hub_download(repo_id=base_model_id, filename='model.safetensors')
+            base_state = load_file(base_model_file)
+            encoder_state = {k.replace('speaker_encoder.', ''): v for k, v in base_state.items() if k.startswith('speaker_encoder.')}
+            qwen3tts.model.speaker_encoder.load_state_dict(encoder_state)
+            qwen3tts.model.speaker_encoder.to(device=qwen3tts.model.device, dtype=qwen3tts.model.dtype)
+            if accelerator.is_main_process:
+                print('✅ Speaker Encoder successfully restored for training.')
+        except Exception as e:
+            if accelerator.is_main_process:
+                print(f'⚠️ Failed to restore Speaker Encoder: {e}', flush=True)
+
     # Force enable gradient checkpointing on the model to reduce activation VRAM bounds
-    if hasattr(qwen3tts.model, "model") and hasattr(qwen3tts.model.model, "gradient_checkpointing_enable"):
+    if hasattr(qwen3tts.model, 'model') and hasattr(qwen3tts.model.model, 'gradient_checkpointing_enable'):
         qwen3tts.model.model.gradient_checkpointing_enable()
-    elif hasattr(qwen3tts.model, "gradient_checkpointing_enable"):
+    elif hasattr(qwen3tts.model, 'gradient_checkpointing_enable'):
         qwen3tts.model.gradient_checkpointing_enable()
 
     config = AutoConfig.from_pretrained(MODEL_PATH)
@@ -115,18 +142,18 @@ def train():
 
     # ── component-level freeze logic (Fixes scrambled voice) ──
     # Freeze the speaker_encoder and acoustic vocoder, limiting optimization to model.talker
-    if hasattr(qwen3tts.model, "speaker_encoder") and qwen3tts.model.speaker_encoder is not None:
+    if hasattr(qwen3tts.model, 'speaker_encoder') and qwen3tts.model.speaker_encoder is not None:
         for p in qwen3tts.model.speaker_encoder.parameters():
             p.requires_grad = False
 
     # Mark all top-level parameters as frozen first
     for p in qwen3tts.model.parameters():
-        if not any(name.startswith("talker") for name, _ in qwen3tts.model.named_parameters()):
+        if not any(name.startswith('talker') for name, _ in qwen3tts.model.named_parameters()):
             p.requires_grad = False
 
     # Explicitly unfreeze only the talker component
     for name, p in qwen3tts.model.named_parameters():
-        if name.startswith("talker"):
+        if name.startswith('talker'):
             p.requires_grad = True
 
     # Setup optimizer strictly on talker parameters (fallback to standard AdamW if bitsandbytes is missing)
@@ -152,31 +179,31 @@ def train():
 
     # ── REGISTERED TRAINING DASHBOARD (Just Before the First Epoch) ──
     if accelerator.is_main_process:
-        print("\n" + "="*70)
-        print("🎙️  QWEN3-TTS FULL-PARAMETER SFT TRAINING ENGINE RUNTIME")
-        print("="*70)
-        print(f"👤 Target Speaker ID         : {args.speaker_name}")
-        print(f"🤖 Initial Model Checkpoint  : {args.init_model_path}")
-        print(f"📂 Output Checkpoint Path    : {args.output_model_path}")
-        print(f"📊 Dataset Size              : {total_samples} samples")
-        print(f"⏱️  Training Epochs Limit     : {num_epochs}")
-        print(f"🔄 Steps per Training Epoch  : {steps_per_epoch}")
-        print(f"📈 Total Batch Accumulations : {total_raw_steps}")
-        print(f"📉 Effective Optimization Steps: {effective_opt_steps} updates")
-        print(f"⚡ Base SFT Learning Rate    : {args.lr}")
-        print(f"🔋 Physical Batch Size       : {args.batch_size}")
-        print(f"🔄 Gradient Accumulation     : {grad_accum_steps}")
-        print(f"🧮 Auto Hardware Precision   : {target_dtype} (Mixed Precision Mode)")
-        print(f"🎯 Local Attention Type     : {attn_implementation}")
-        print(f"🛠️  Loaded Optimizer         : {optimizer_name}")
-        print(f"⚙️  Optimized Module          : model.talker (Frozen encoder/vocoder)")
-        print("="*70 + "\n")
+        print('\n' + '='*70)
+        print('🎙️  QWEN3-TTS FULL-PARAMETER SFT TRAINING ENGINE RUNTIME')
+        print('='*70)
+        print(f'👤 Target Speaker ID         : {args.speaker_name}')
+        print(f'🤖 Initial Model Checkpoint  : {args.init_model_path}')
+        print(f'📂 Output Checkpoint Path    : {args.output_model_path}')
+        print(f'📊 Dataset Size              : {total_samples} samples')
+        print(f'⏱️  Training Epochs Limit     : {num_epochs}')
+        print(f'🔄 Steps per Training Epoch  : {steps_per_epoch}')
+        print(f'📈 Total Batch Accumulations : {total_raw_steps}')
+        print(f'📉 Effective Optimization Steps: {effective_opt_steps} updates')
+        print(f'⚡ Base SFT Learning Rate    : {args.lr}')
+        print(f'🔋 Physical Batch Size       : {args.batch_size}')
+        print(f'🔄 Gradient Accumulation     : {grad_accum_steps}')
+        print(f'🧮 Auto Hardware Precision   : {target_dtype} (Mixed Precision Mode)')
+        print(f'🎯 Local Attention Type     : {attn_implementation}')
+        print(f'🛠️  Loaded Optimizer         : {optimizer_name}')
+        print(f'⚙️  Optimized Module          : model.talker (Frozen encoder/vocoder)')
+        print('='*70 + '\n')
 
     model.train()
 
     for epoch in range(num_epochs):
         # Keep speaker encoder strictly in evaluation mode
-        if hasattr(model, "speaker_encoder") and model.speaker_encoder is not None:
+        if hasattr(model, 'speaker_encoder') and model.speaker_encoder is not None:
             model.speaker_encoder.eval()
 
         for step, batch in enumerate(train_dataloader):
@@ -217,7 +244,6 @@ def train():
                     codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
                     input_embeddings = input_embeddings + codec_i_embedding
 
-                # Bug Fix 2: Avoid manual shift to prevent double label-shifting in ForCausalLMLoss
                 outputs = model.talker(
                     inputs_embeds=input_embeddings,
                     attention_mask=attention_mask,
@@ -248,6 +274,20 @@ def train():
                 accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
 
         if accelerator.is_main_process:
+            # ── PRE-PRUNING OLDER CHECKPOINTS ──
+            # Deletes older checkpoints BEFORE saving the new one to strictly keep the Kaggle disk usage under 9.1 GB (Resolves quota error)
+            output_path_obj = Path(args.output_model_path)
+            saved_checkpoints = sorted(
+                output_path_obj.glob('checkpoint-epoch-*'),
+                key=lambda x: int(x.name.split('-epoch-')[-1]) if '-epoch-' in x.name else -1
+            )
+            for old_ckpt in saved_checkpoints:
+                try:
+                    shutil.rmtree(old_ckpt)
+                    print(f'🧹 Pruned older checkpoint to free space: {old_ckpt.name}')
+                except Exception:
+                    pass
+
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
             
             # Resolve the actual local model cache directory using snapshot_download
@@ -288,21 +328,7 @@ def train():
             state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
             save_path = os.path.join(output_dir, "model.safetensors")
             save_file(state_dict, save_path)
-
-            # Checkpoint Pruning using stable numerical sort by epoch index
-            output_path_obj = Path(args.output_model_path)
-            saved_checkpoints = sorted(
-                output_path_obj.glob("checkpoint-epoch-*"),
-                key=lambda x: int(x.name.split("-epoch-")[-1]) if "-epoch-" in x.name else -1
-            )
-            max_keep = 1
-            if len(saved_checkpoints) > max_keep:
-                for old_ckpt in saved_checkpoints[:-max_keep]:
-                    try:
-                        shutil.rmtree(old_ckpt)
-                        print(f"🧹 Pruned older checkpoint to conserve disk: {old_ckpt.name}")
-                    except Exception as e:
-                        print(f"⚠️ Failed to delete older checkpoint {old_ckpt.name}: {e}")
+            print(f'✅ Saved updated model weights to: {output_dir}')
 
 if __name__ == "__main__":
     train()
