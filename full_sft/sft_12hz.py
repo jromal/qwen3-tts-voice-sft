@@ -113,13 +113,29 @@ def train():
     dataset = TTSDataset(train_data, qwen3tts.processor, config)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    # Setup optimizer (fallback to standard AdamW if bitsandbytes is missing)
+    # ── component-level freeze logic (Fixes scrambled voice) ──
+    # Freeze the speaker_encoder and acoustic vocoder, limiting optimization to model.talker
+    if hasattr(qwen3tts.model, "speaker_encoder") and qwen3tts.model.speaker_encoder is not None:
+        for p in qwen3tts.model.speaker_encoder.parameters():
+            p.requires_grad = False
+
+    # Mark all top-level parameters as frozen first
+    for p in qwen3tts.model.parameters():
+        if not any(name.startswith("talker") for name, _ in qwen3tts.model.named_parameters()):
+            p.requires_grad = False
+
+    # Explicitly unfreeze only the talker component
+    for name, p in qwen3tts.model.named_parameters():
+        if name.startswith("talker"):
+            p.requires_grad = True
+
+    # Setup optimizer strictly on talker parameters (fallback to standard AdamW if bitsandbytes is missing)
     try:
         import bitsandbytes as bnb
-        optimizer = bnb.optim.PagedAdamW8bit(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+        optimizer = bnb.optim.PagedAdamW8bit(qwen3tts.model.talker.parameters(), lr=args.lr, weight_decay=0.01)
         optimizer_name = "PagedAdamW8bit (bitsandbytes)"
     except ImportError:
-        optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+        optimizer = AdamW(qwen3tts.model.talker.parameters(), lr=args.lr, weight_decay=0.01)
         optimizer_name = "Standard AdamW (PyTorch)"
 
     model, optimizer, train_dataloader = accelerator.prepare(
@@ -142,7 +158,7 @@ def train():
         print(f"👤 Target Speaker ID         : {args.speaker_name}")
         print(f"🤖 Initial Model Checkpoint  : {args.init_model_path}")
         print(f"📂 Output Checkpoint Path    : {args.output_model_path}")
-        print(f"📊 Dataset Size              : {total_samples} samples (approx. {round((total_samples * 6) / 60, 1)} minutes)")
+        print(f"📊 Dataset Size              : {total_samples} samples")
         print(f"⏱️  Training Epochs Limit     : {num_epochs}")
         print(f"🔄 Steps per Training Epoch  : {steps_per_epoch}")
         print(f"📈 Total Batch Accumulations : {total_raw_steps}")
@@ -153,11 +169,16 @@ def train():
         print(f"🧮 Auto Hardware Precision   : {target_dtype} (Mixed Precision Mode)")
         print(f"🎯 Local Attention Type     : {attn_implementation}")
         print(f"🛠️  Loaded Optimizer         : {optimizer_name}")
+        print(f"⚙️  Optimized Module          : model.talker (Frozen encoder/vocoder)")
         print("="*70 + "\n")
 
     model.train()
 
     for epoch in range(num_epochs):
+        # Keep speaker encoder strictly in evaluation mode
+        if hasattr(model, "speaker_encoder") and model.speaker_encoder is not None:
+            model.speaker_encoder.eval()
+
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
 
@@ -177,12 +198,14 @@ def train():
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                # Bug Fix 1: Apply the missing text projection layer on text embeddings
-                input_text_embedding = (
-                    model.talker.text_projection(
-                        model.talker.model.text_embedding(input_text_ids)
-                    ) * text_embedding_mask
-                )
+                # Dynamic Check: Avoid applying text_projection on 1.7B (fixes scrambled voice mismatch)
+                raw_text_embedding = model.talker.model.text_embedding(input_text_ids)
+                if raw_text_embedding.shape[-1] != model.talker.model.codec_embedding.weight.shape[-1]:
+                    input_text_embedding = (
+                        model.talker.text_projection(raw_text_embedding) * text_embedding_mask
+                    )
+                else:
+                    input_text_embedding = raw_text_embedding * text_embedding_mask
                 
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
                 input_codec_embedding[:, 6, :] = speaker_embedding
@@ -240,7 +263,7 @@ def train():
             output_config_file = os.path.join(output_dir, "config.json")
             with open(input_config_file, 'r', encoding='utf-8') as f:
                 config_dict = json.load(f)
-            config_dict["tts_model_type"] = "custom_voice"
+            config_dict["tts_model_type"] = "base"  # Retains full-parameter base config to support ICL
             talker_config = config_dict.get("talker_config", {})
             talker_config["spk_id"] = {
                 args.speaker_name: 3000
@@ -259,11 +282,7 @@ def train():
                 for k, v in unwrapped_model.state_dict().items()
             }
 
-            # Commented out the dropping of speaker_encoder weights to retain in-context zero-shot capabilities during inference
-            # drop_prefix = "speaker_encoder"
-            # keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
-            # for k in keys_to_drop:
-            #     del state_dict[k]
+            # Dropping speaker_encoder weights is bypassed to preserve in-context zero-shot capabilities during inference
 
             weight = state_dict['talker.model.codec_embedding.weight']
             state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
