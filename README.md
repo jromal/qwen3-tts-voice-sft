@@ -27,7 +27,7 @@ qwen3-tts-voice-sft/
 
 ## 🛠️ Upgraded SFT Core Patches (`full_sft/sft_12hz.py`)
 
-The full-parameter SFT training engine has been updated with several critical algorithmic fixes to prevent weight corruption and audio degradation:
+The full-parameter SFT training engine has been updated with several critical performance and stability patches:
 
 ### 1. Dynamic `text_projection` Bypass Check
 *   **The Issue:** On the 1.7B parameter base model, the text embedding dimension (2048) matches the transformer hidden dimension (2048). Consequently, the 1.7B model bypasses the text projection layer entirely during standard inference.
@@ -139,7 +139,7 @@ Your-Voice-Dataset/
 ```
 
 ### Critical Audio Processing Rules:
-*   **The Resampling Rule (Extremely Important):** Every `.wav` file inside `wavs/` **must be pre-resampled to exactly 24,000 Hz (24 kHz) Mono** prior to running the training pipeline. Standard 16 kHz or 48 kHz recordings will cause the tokenizer to extract invalid codec tokens, causing the model to learn distorted, static sound.
+*   **The Resampling Rule (Extremely Important):** Every `.wav` file inside `wavs/` **must be pre-resampled to exactly 24,000 Hz (24 kHz) Mono** prior to running the training pipeline. Standard 16 kHz or 48 kHz recordings will cause the tokenizer to extract incorrect codec tokens, causing the model to learn distorted, static sound.
 *   **Temporal Sizing:** Aim for clean audio clips cut to lengths between 2 and 10 seconds.
 *   **Vocal Quality:** Ensure background noise is removed (recommended Signal-to-Noise Ratio: SNR > 20dB).
 *   **Identity Lock:** Each line of your JSONL manifest should contain a `"language": "en"` key (or match your target speaker locale) to prevent identity drift during multi-turn script rendering.
@@ -192,10 +192,16 @@ Clones this repository and executes the following setup command to overwrite the
 ```bash
 !cp qwen3-tts-voice-sft/full_sft/sft_12hz.py Qwen3-TTS/finetuning/sft_12hz.py
 ```
+*   **Three-Tier Epoch Scaling:** Replaced the legacy single auto-epoch logic with a granular, 3-tier adaptive scaling system selectable directly from your configuration dashboard:
+    *   `'full'` (Rule of 720): $\text{Epochs} = \text{round}(720 / N)$, capped cleanly between 4 and 20. Optimized for larger, highly diverse datasets.
+    *   `'medium'` (Rule of 540): $\text{Epochs} = \text{round}(540 / N)$, capped cleanly between 3 and 15. The recommended baseline default (providing the sweet spot of phonetic detailing and style flexibility).
+    *   `'half'` (Rule of 360): $\text{Epochs} = \text{round}(360 / N)$, capped cleanly between 3 and 10. Prevents overfitting and vocal burning on tiny, highly uniform datasets.
+*   **Dashboard-Exposed Learning Rate:** The SFT learning rate is now fully exposed as a configurable parameter on the dashboard (Step 1), defaulting to `1e-6`. It supports:
+    *   `2e-6` (Aggressive / standard; best for very large, multi-hour voice pools).
+    *   `1e-6` (Recommended standard baseline for typical 15-30 minute SFT runs).
+    *   `5e-7` (Conservative / delicate; designed to prevent metallic distortions on small, pristine datasets under 15 minutes).
 *   **Dual-Naming Reference Copies:** During Step 5, the notebook automatically copies both `ref.wav` and `ref.txt` to the final epoch folder using dual names (`ref.wav`/`ref_sample.wav` and `ref.txt`/`ref_sample.txt`).
 *   **Standalone Checkpoint Preservation:** The export script preserves the foundational text processor configurations (`vocab.json`, `merges.txt`, `tokenizer_config.json`, and `preprocessor_config.json`) inside the final saved directory. This ensures the output checkpoint remains fully loadable via standard `Qwen3TTSModel.from_pretrained(...)`.
-*   **Rule of 720:** Epochs scale dynamically via:
-    $$\text{Epochs} = \text{round}\left(\frac{720}{N}\right) \quad \text{[Bounded between 4 and 20]}$$
 
 ### 2. PEFT LoRA Training Notebook (`WtB_Qwen3_TTS_LoRA_Training.ipynb`)
 Clones this repository and copies both the PEFT training script and the corresponding inference adapter logic:
