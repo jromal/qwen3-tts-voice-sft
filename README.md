@@ -48,7 +48,7 @@ The full-parameter SFT training engine has been updated with several critical al
 
 ### 3. Double-Shift Slice Correction (Resolving Progressive Acceleration)
 *   **The Problem:** Manoevering target labels before they reach the Hugging Face causal loss module can cause double-shifting. This causes the model to learn a temporal compression error, meaning the synthesized voice accelerates progressively over successive training epochs until it is completely fast-forwarded and unintelligible.
-*   **The Fix:** Rather than pre-shifting, standard unshifted labels are passed directly to `ForCausalLMLoss`. Slicing is performed strictly on aligning the hidden states `[:-1]` with target codec indices `[1:]` through a contiguous mask:
+*   **The Fix:** Rather than pre-shifting, unshifted labels are passed directly to `ForCausalLMLoss`. Slicing is performed strictly on aligning the hidden states `[:-1]` with target codec indices `[1:]` through a contiguous mask:
     ```python
     hidden_states = outputs.hidden_states[0][-1]
     target_codec_mask = codec_mask[:, 1:]
@@ -125,7 +125,7 @@ Hugging Face enforces a strict 100 GB private storage cap on free tier accounts.
 
 ## 📂 Dataset Preparation & Layout
 
-To train either a Full SFT model or a LoRA adapter, compress your custom single-speaker dataset as a `.zip` archive or upload it directly with this directory layout:
+To train either a Full SFT model or a LoRA adapter, construct your single-speaker dataset directory structure as follows:
 
 ```text
 Your-Voice-Dataset/
@@ -138,15 +138,48 @@ Your-Voice-Dataset/
     └── ...
 ```
 
-### Critical Processing & Metadata Rules:
-* **Audio Resampling:** Every `.wav` file inside `wavs/` **must be pre-resampled to exactly 24,000 Hz (24 kHz) Mono** prior to running the training pipeline. Uploading standard 44.1 kHz or 48 kHz clips will cause the tokenizer to extract incorrect codec sequences, degrading speaker identity and vocal clarity.
-* **Temporal Sizing:** Aim for clean audio clips cut to lengths between 2 and 10 seconds, with background noise removed (SNR > 20dB).
-* **Identity Lock:** Each line of your JSONL manifest should contain a `"language": "en"` key (or match your target speaker locale) to prevent identity drift during multi-turn script rendering.
+### Critical Audio Processing Rules:
+*   **The Resampling Rule (Extremely Important):** Every `.wav` file inside `wavs/` **must be pre-resampled to exactly 24,000 Hz (24 kHz) Mono** prior to running the training pipeline. Standard 16 kHz or 48 kHz recordings will cause the tokenizer to extract invalid codec tokens, causing the model to learn distorted, static sound.
+*   **Temporal Sizing:** Aim for clean audio clips cut to lengths between 2 and 10 seconds.
+*   **Vocal Quality:** Ensure background noise is removed (recommended Signal-to-Noise Ratio: SNR > 20dB).
+*   **Identity Lock:** Each line of your JSONL manifest should contain a `"language": "en"` key (or match your target speaker locale) to prevent identity drift during multi-turn script rendering.
 
 ### Manifest Example (`train_raw.jsonl`)
 ```json
 {"audio": "./wavs/utt0001.wav", "text": "This is a clean, resampled training sentence.", "ref_audio": "./ref.wav", "language": "en"}
 ```
+
+---
+
+## ☁️ Kaggle Dataset Upload & Integration
+
+To train inside Kaggle's free Tesla T4 GPU environments, you must package, upload, and attach your dataset correctly so that the notebook's dynamic scanner can ingest it.
+
+### Step 1: Package Your Local Dataset
+1.  Verify that your audio clips are resampled to **24,000 Hz Mono**.
+2.  Structure your files locally to match the `Your-Voice-Dataset/` directory layout shown in the section above.
+3.  Compress the root folder into a standard **`.zip` archive** (e.g., `david_attenborough_dataset.zip`). 
+    *   *Note: Ensure the zip contains the files directly (e.g., opening the zip should show `train_raw.jsonl`, `ref.wav`, and the `wavs/` directory), without any double-nested directories.*
+
+### Step 2: Upload to Kaggle
+1.  Log in to [Kaggle](https://www.kaggle.com).
+2.  On the left-hand navigation sidebar, click on **+ Create** and select **New Dataset**.
+3.  Enter a clear, hyphenated Dataset Title (e.g., `david-attenborough-voice-sft`).
+4.  Drag and drop your `david_attenborough_dataset.zip` archive into the upload window.
+5.  Click **Create** at the bottom-right. Kaggle will unzip and mount the dataset in the cloud.
+
+### Step 3: Attach the Dataset to Your SFT Notebook
+1.  Open your SFT training notebook (**`WtB_Qwen3_TTS_Finetuning.ipynb`** or **`WtB_Qwen3_TTS_LoRA_Training.ipynb`**) inside your Kaggle workspace.
+2.  On the right-hand panel, locate the **Input** configuration sidebar.
+3.  Click on **+ Add Input**.
+4.  In the search bar, select **Your Work** (or search for the title you entered in Step 2, such as `david-attenborough-voice-sft`).
+5.  Click the **Add** button next to your dataset. It will be mounted at `/kaggle/input/david-attenborough-voice-sft/`.
+
+### How the Ingestion Code Resolves Your Dataset
+The code executed inside **Step 4** of your SFT notebook uses an automated recursive search:
+*   It scans the entire `/kaggle/input` path on disk to dynamically locate your `train_raw.jsonl`, `ref.wav`, and `ref.txt` files.
+*   Once located, it automatically identifies your custom directory names, replicates the exact structure inside your local workspace, and copies your WAV clips.
+*   This means **the pipeline will execute successfully even if you rename your ZIP file, change your Kaggle dataset title, or if Kaggle mounts the files inside nested subdirectories**.
 
 ---
 
