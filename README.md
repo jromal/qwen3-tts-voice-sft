@@ -207,6 +207,12 @@ Clones this repository and copies both the PEFT training script and the correspo
     $$\text{Epochs} = \text{round}\left(\frac{1200}{N}\right) \quad \text{[Bounded between 6 and 30]}$$
 *   **Metadata Bypass:** Automatically deletes `README.md` right before uploading checkpoints to Hugging Face, bypassing standard server-side metadata parser rejections.
 
+### 3. Unified Inference & Audit Notebook (`WtB_Qwen3_TTS_and_Whisper.ipynb`)
+Clones this repository to set up and host the Gradio production generation and post-production auditing server:
+*   **Hugging Face Variable Injection:** Seamlessly logs in and dynamically scans available branches on your model hub repository to compile custom speaker character choices.
+*   **Physical Hardware Acceleration Casting:** Overrides wrapper loading limitations by explicitly executing `current_tts_model.model.to(DEVICE)` to cast all model layers onto active GPU memory, reducing execution times from minutes to under 3 seconds.
+*   **Dynamic safe ceiling limiter:** Replaces standard static generation length constraints with a text-proportional mathematical safe token ceiling to eliminate infinite autoregressive loop hangs.
+
 ---
 
 ## 🚀 Unified Inference & Deployment
@@ -233,6 +239,11 @@ $$\text{max\_new\_tokens} = \min\left(4096, \max\left(250, \text{round}\left(C \
 ### 4. Precision & Hardware Tuning
 *   **Turing GPU Precision Stability:** Turing-architecture GPUs (such as the Tesla T4) suffer from PyTorch SDPA attention stability issues under native `float16` precision. Forcing `DTYPE_TTS = torch.bfloat16` with `"attn_implementation": "sdpa"` completely prevents underflow NaNs and process-halting crashes on T4 cloud VMs.
 *   **Physical Hardware Casting:** High-level wrapper pipelines can cause weights to remain partially on CPU memory, spike system CPU to 100%, and hang inference. Explicitly casting the model via `current_tts_model.model.to(DEVICE)` right after load-time moves all weight matrices onto GPU memory, accelerating execution speeds.
+
+### 5. Quality Audit & Timestamp Correction Tab
+The Quality Audit tab hosts a high-precision post-production aligner powered by **Stable-TS (Whisper large-v3)**.
+*   **Word-Level Forced Alignment:** Accepts any input audio along with a manuscript text prompt to output aligned, millisecond-accurate word-level timestamp coordinates.
+*   **Onset Correction Scan:** Autoregressive Whisper models suffer from an origin-snapping alignment bug where silent audio buffers at the start of a clip cause word timings to snap falsely to `0.00` seconds. The audit engine runs an active RMS energy scan to find the physical sound onset threshold (dB > -40) and applies a matching mathematical shift, ensuring aligned timestamp outputs are accurate.
 
 ---
 
